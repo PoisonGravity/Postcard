@@ -161,3 +161,69 @@ create policy "users upload own postcard media" on storage.objects for insert to
 create policy "users read own postcard media" on storage.objects for select to authenticated using (bucket_id = 'postcard-media' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "users delete own postcard media" on storage.objects for delete to authenticated using (bucket_id = 'postcard-media' and (storage.foldername(name))[1] = auth.uid()::text);
 
+-- Enforce immutable identities and legal state transitions even for direct REST calls.
+create or replace function public.guard_friendship()
+returns trigger language plpgsql security invoker set search_path = '' as $$
+begin
+  if TG_OP = 'INSERT' then
+    if new.requester_id <> auth.uid() or new.status <> 'pending' then
+      raise exception 'only pending requests may be created';
+    end if;
+  else
+    if new.requester_id <> old.requester_id or new.addressee_id <> old.addressee_id or new.id <> old.id or new.created_at <> old.created_at then
+      raise exception 'friendship identities cannot change';
+    end if;
+    if new.status <> old.status and not (old.status = 'pending' and new.status in ('accepted','declined') and old.addressee_id = auth.uid()) then
+      raise exception 'only recipient may accept or decline a pending request';
+    end if;
+  end if;
+  return new;
+end; $$;
+create trigger guard_friendship before insert or update on public.friendships
+for each row execute function public.guard_friendship();
+create unique index friendships_unordered_pair on public.friendships (least(requester_id,addressee_id),greatest(requester_id,addressee_id));
+create index friendships_addressee on public.friendships(addressee_id,status);
+
+create or replace function public.guard_postcard()
+returns trigger language plpgsql security invoker set search_path = '' as $$
+begin
+  if TG_OP = 'INSERT' then
+    if new.sender_id <> auth.uid() or new.status <> 'sent' or nullif(btrim(new.title),'') is null then raise exception 'invalid postcard'; end if;
+    if split_part(new.source_path,'/',1) <> auth.uid()::text or new.source_path is null then raise exception 'invalid photo owner'; end if;
+    if not exists (select 1 from storage.objects where bucket_id='postcard-media' and name=new.source_path) then raise exception 'photo is not uploaded'; end if;
+  else
+    if new.sender_id <> old.sender_id or new.recipient_id <> old.recipient_id or new.source_path is distinct from old.source_path or new.rendered_path is distinct from old.rendered_path or new.style_skill_id is distinct from old.style_skill_id or new.title <> old.title or new.body <> old.body or new.city is distinct from old.city or new.sent_at is distinct from old.sent_at or new.created_at <> old.created_at or new.id <> old.id then
+      raise exception 'sent postcard content is immutable';
+    end if;
+    if old.recipient_id <> auth.uid() or old.status not in ('sent','opened') or new.status <> 'opened' then raise exception 'only recipient can open'; end if;
+    new.opened_at := coalesce(old.opened_at,now());
+  end if;
+  return new;
+end; $$;
+create trigger guard_postcard before insert or update on public.postcards
+for each row execute function public.guard_postcard();
+alter table public.postcards add constraint postcard_text_limits check (length(title) between 1 and 120 and length(body)<=2000 and length(city)<=100);
+create index postcards_recipient_created on public.postcards(recipient_id,created_at desc);
+create index postcards_sender_created on public.postcards(sender_id,created_at desc);
+
+drop policy "participants add postcard events" on public.postcard_events;
+create policy "participants add postcard events" on public.postcard_events for insert to authenticated
+with check (actor_id=auth.uid() and exists (select 1 from public.postcards p where p.id=postcard_id and (p.sender_id=auth.uid() or p.recipient_id=auth.uid())));
+create policy "recipients read received photos" on storage.objects for select to authenticated
+using (bucket_id='postcard-media' and exists (select 1 from public.postcards p where p.source_path=name and p.recipient_id=auth.uid() and p.status in ('sent','opened','archived')));
+
+-- This trigger needs definer privileges only to bootstrap the auth user's profile.
+create schema if not exists private;
+create or replace function private.bootstrap_profile()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  insert into public.profiles(id,display_name) values (new.id,left(coalesce(new.raw_user_meta_data->>'display_name',''),40));
+  return new;
+end; $$;
+revoke all on function private.bootstrap_profile() from public,anon,authenticated;
+create trigger bootstrap_profile after insert on auth.users for each row execute function private.bootstrap_profile();
+revoke all on function public.is_accepted_friend(uuid,uuid) from public,anon;
+grant execute on function public.is_accepted_friend(uuid,uuid) to authenticated;
+grant usage on schema public to authenticated;
+grant select,insert,update,delete on public.profiles,public.friendships,public.style_skills,public.postcards,public.postcard_events to authenticated;
+
