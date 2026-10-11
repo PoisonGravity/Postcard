@@ -65,7 +65,7 @@ create table if not exists public.postcard_events (
 );
 
 create or replace function public.is_accepted_friend(a uuid, b uuid)
-returns boolean language sql stable security definer set search_path = public as $$
+returns boolean language sql stable security invoker set search_path = public as $$
   select exists (
     select 1 from public.friendships f
     where f.status = 'accepted'
@@ -157,6 +157,7 @@ create policy "participants view postcard events" on public.postcard_events for 
 create policy "participants add postcard events" on public.postcard_events for insert to authenticated with check (actor_id = auth.uid());
 
 insert into storage.buckets (id, name, public) values ('postcard-media','postcard-media',false) on conflict (id) do nothing;
+update storage.buckets set file_size_limit=10485760, allowed_mime_types=array['image/jpeg','image/png','image/webp'] where id='postcard-media';
 create policy "users upload own postcard media" on storage.objects for insert to authenticated with check (bucket_id = 'postcard-media' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "users read own postcard media" on storage.objects for select to authenticated using (bucket_id = 'postcard-media' and (storage.foldername(name))[1] = auth.uid()::text);
 create policy "users delete own postcard media" on storage.objects for delete to authenticated using (bucket_id = 'postcard-media' and (storage.foldername(name))[1] = auth.uid()::text);
